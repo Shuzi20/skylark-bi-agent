@@ -1,38 +1,111 @@
 # context_builder.py
 # Builds pre-computed stats passed to the LLM as structured context.
-# No keyword filtering — full data always sent so LLM can answer ANY question.
+# Interpretation logic lives HERE — not in the prompt.
+# Prompt only formats and presents. This layer computes and interprets.
 
 import json
 import pandas as pd
 import numpy as np
-import streamlit as st
+from datetime import timedelta
 
 
 def _cr(value):
-    """Convert raw rupees to crore string."""
     if value is None or (isinstance(value, float) and np.isnan(value)):
         return "N/A"
     cr = value / 10_000_000
     return f"Rs {cr:.2f} Cr"
 
 
-def build_deals_context(deals_df):
-    """
-    Pre-compute ALL deal metrics:
-    - Overall summary
-    - Per-sector: total, status breakdown, probability per status, value stats
-    - Win rates (won / won+dead)
-    - Open deals detail
-    """
-    ctx = {}
+# ─────────────────────────────────────────
+# INTERPRETATION HELPERS — data-driven, not prompt-injected
+# ─────────────────────────────────────────
 
+def _interpret_velocity(velocity_dict):
+    """
+    Pre-compute velocity trend from data.
+    Prompt reads this label — never infers it from raw numbers.
+    """
+    if not velocity_dict:
+        return "insufficient data"
+
+    counts = [v["deals_created"] for v in velocity_dict.values()]
+    months = list(velocity_dict.keys())
+
+    if len(counts) < 2:
+        return "insufficient data"
+
+    max_val = max(counts)
+    avg_others = (sum(counts) - max_val) / max(len(counts) - 1, 1)
+
+    # Spike: one month is 5x+ average of the others
+    if max_val > 0 and avg_others > 0 and max_val >= 5 * avg_others:
+        spike_month = months[counts.index(max_val)]
+        return f"SPIKE in {spike_month} ({max_val} deals) — likely batch entry or real growth burst. Treat with caution."
+
+    # Slowdown: each month strictly decreasing
+    if all(counts[i] >= counts[i + 1] for i in range(len(counts) - 1)):
+        return "SLOWDOWN — deal creation declining month over month"
+
+    # Growth: each month strictly increasing
+    if all(counts[i] <= counts[i + 1] for i in range(len(counts) - 1)):
+        return "GROWTH — deal creation accelerating"
+
+    return "MIXED — no clear trend across available months"
+
+
+def _flag_collection_rates(sector_stats):
+    """
+    Pre-compute collection rate flags with guardrails.
+    Only flags sectors with 3+ work orders (avoids false alarms on missing data).
+    """
+    urgent = []
+    healthy = []
+
+    for sector, stats in sector_stats.items():
+        rate_str = stats.get("collection_rate", "N/A")
+        total_orders = stats.get("total_orders", 0)
+
+        # Guardrail: skip if no WOs or insufficient sample
+        if rate_str == "N/A" or total_orders < 3:
+            continue
+
+        try:
+            rate = float(rate_str.replace("%", ""))
+        except (ValueError, TypeError):
+            continue
+
+        if rate < 5:
+            receivable = stats.get("receivable", "N/A")
+            urgent.append({
+                "sector": sector,
+                "collection_rate": rate_str,
+                "receivable_stuck": receivable,
+                "total_orders": total_orders
+            })
+        elif rate >= 60:
+            healthy.append({
+                "sector": sector,
+                "collection_rate": rate_str
+            })
+
+    return {"urgent_blockers": urgent, "healthy_sectors": healthy}
+
+
+# ─────────────────────────────────────────
+# DEALS CONTEXT
+# ─────────────────────────────────────────
+
+def build_deals_context(deals_df):
+    deals_df = deals_df.copy()
+    for col in ["created_date", "close_date", "tentative_close_date"]:
+        if col in deals_df.columns:
+            deals_df[col] = pd.to_datetime(deals_df[col], errors="coerce")
+
+    ctx = {}
     total = len(deals_df)
     ctx["total_deals"] = total
-
-    # ── Overall status ──
     ctx["overall_status"] = deals_df["deal_status"].value_counts().to_dict()
 
-    # ── Overall value ──
     all_vals = deals_df["deal_value"].dropna()
     all_vals = all_vals[all_vals > 0]
     ctx["total_pipeline_value"] = _cr(all_vals.sum()) if len(all_vals) else "N/A"
@@ -40,17 +113,16 @@ def build_deals_context(deals_df):
     ctx["deals_missing_values"] = total - len(all_vals)
     ctx["pct_missing_values"] = f"{round((total - len(all_vals)) / max(total, 1) * 100)}%"
 
-    # ── Overall probability ──
     prob_counts = deals_df["closure_probability"].value_counts().to_dict()
     ctx["closure_probability_overall"] = {
         "High": prob_counts.get("High", 0),
         "Medium": prob_counts.get("Medium", 0),
         "Low": prob_counts.get("Low", 0),
         "missing": int(deals_df["closure_probability"].isna().sum()),
-        "pct_missing": f"{round(deals_df['closure_probability'].isna().sum() / max(total,1) * 100)}%"
+        "pct_missing": f"{round(deals_df['closure_probability'].isna().sum() / max(total, 1) * 100)}%"
     }
 
-    # ── Per-sector deep stats ──
+    # ── Per-sector stats ──
     sector_stats = {}
     for sector in sorted(deals_df["sector"].dropna().unique()):
         s = deals_df[deals_df["sector"] == sector]
@@ -63,10 +135,13 @@ def build_deals_context(deals_df):
         vals = s["deal_value"].dropna()
         vals = vals[vals > 0]
 
-        # Probability ONLY for open deals (not all deals)
         open_deals = s[s["deal_status"] == "Open"]
         open_prob = open_deals["closure_probability"].value_counts().to_dict()
         open_unrated = int(open_deals["closure_probability"].isna().sum())
+
+        # Null-safe win rate
+        win_rate = f"{round(won / total_closed * 100, 1)}%" if total_closed > 0 else "N/A (no closed deals)"
+        insufficient = total_closed < 5
 
         sector_stats[sector] = {
             "total": len(s),
@@ -74,76 +149,149 @@ def build_deals_context(deals_df):
             "dead": dead,
             "open": open_,
             "on_hold": on_hold,
-            "win_rate": f"{round(won / total_closed * 100, 1)}%" if total_closed > 0 else "N/A (no closed deals)",
-            "open_deals_probability": {
-                **open_prob,
-                "unrated": open_unrated
-            },
+            "total_closed": total_closed,
+            "win_rate": win_rate,
+            "insufficient_sample": insufficient,
+            "open_deals_probability": {**open_prob, "unrated": open_unrated},
             "deals_with_values": len(vals),
             "deals_missing_values": len(s) - len(vals),
             "total_value": _cr(vals.sum()) if len(vals) else "N/A",
             "avg_value": _cr(vals.mean()) if len(vals) else "N/A",
-            "max_value": _cr(vals.max()) if len(vals) else "N/A",
         }
-
     ctx["by_sector"] = sector_stats
 
-    # ── Win rate ranking ──
-    win_rate_rank = sorted(
+    # ── Win rate ranking (only sectors with 5+ closed deals) ──
+    ctx["win_rate_ranking"] = sorted(
         [
-            {"sector": k, "win_rate_pct": v["win_rate"], "won": v["won"], "total": v["total"]}
+            {
+                "sector": k,
+                "win_rate": v["win_rate"],
+                "won": v["won"],
+                "total_closed": v["total_closed"],
+                "note": "insufficient sample (<5 closed deals)" if v["insufficient_sample"] else ""
+            }
             for k, v in sector_stats.items()
             if v["win_rate"] != "N/A (no closed deals)"
         ],
-        key=lambda x: float(x["win_rate_pct"].replace("%", "")) if "%" in str(x["win_rate_pct"]) else 0,
+        key=lambda x: float(x["win_rate"].replace("%", "")) if "%" in str(x["win_rate"]) else 0,
         reverse=True
     )
-    ctx["win_rate_ranking"] = win_rate_rank
 
-    # ── On hold deals detail ──
+    # ── On Hold deals ──
     oh = deals_df[deals_df["deal_status"] == "On Hold"]
     ctx["on_hold_deals"] = [
         {
             "name": row["deal_name"],
             "sector": row["sector"],
-            "probability": row["closure_probability"] if pd.notna(row.get("closure_probability")) else "unrated",
-            "value": _cr(row["deal_value"]) if pd.notna(row.get("deal_value")) and row.get("deal_value", 0) > 0 else "N/A"
+            "probability": row["closure_probability"] if pd.notna(row.get("closure_probability")) else "unrated"
         }
         for _, row in oh.iterrows()
     ]
 
-    # ── Open deals detail (top 20) ──
-    open_deals_df = deals_df[deals_df["deal_status"] == "Open"].head(20)
-    ctx["open_deals_sample"] = [
-        {
-            "name": row["deal_name"],
-            "sector": row["sector"],
-            "probability": row["closure_probability"] if pd.notna(row.get("closure_probability")) else "unrated",
-            "value": _cr(row["deal_value"]) if pd.notna(row.get("deal_value")) and row.get("deal_value", 0) > 0 else "N/A",
-            "stage": row.get("deal_stage")
+    # ── Funnel stage breakdown ──
+    if "deal_stage" in deals_df.columns:
+        stage_funnel = {
+            "Top of Funnel (Lead/SQL/Demo)": ["A. Lead Generated", "B. Sales Qualified Leads", "C. Demo Done"],
+            "Mid Funnel (Proposal/Negotiation)": ["D. Feasibility", "E. Proposal/Commercials Sent", "F. Negotiations"],
+            "Late Stage (Won/WO/POC)": ["G. Project Won", "H. Work Order Received", "I. POC"],
+            "Closed Won (Billing)": ["Project Completed", "J. Invoice sent", "K. Amount Accrued"],
+            "Closed Lost": ["L. Project Lost", "M. Projects On Hold", "N. Not relevant at the moment", "O. Not Relevant at all"],
         }
-        for _, row in open_deals_df.iterrows()
-    ]
+        ctx["funnel_stage_breakdown"] = {
+            group: len(deals_df[deals_df["deal_stage"].isin(stages)])
+            for group, stages in stage_funnel.items()
+        }
+
+    # ── TIME-BASED VELOCITY ──
+    if "created_date" in deals_df.columns:
+        deals_with_dates = deals_df[deals_df["created_date"].notna()].copy()
+
+        if len(deals_with_dates) > 0:
+            now = deals_df["created_date"].max()
+
+            # Monthly velocity last 3 months
+            velocity = {}
+            for i in range(3, 0, -1):
+                start = now - timedelta(days=30 * i)
+                end = now - timedelta(days=30 * (i - 1))
+                label = start.strftime("%b %Y")
+                created = len(deals_with_dates[
+                    (deals_with_dates["created_date"] >= start) &
+                    (deals_with_dates["created_date"] < end)
+                ])
+                velocity[label] = {"deals_created": created}
+
+            ctx["deal_creation_velocity_last_3_months"] = velocity
+            # Pre-computed interpretation — prompt reads this, never infers it
+            ctx["velocity_interpretation"] = _interpret_velocity(velocity)
+
+            # Wins per month
+            won_df = deals_df[deals_df["deal_status"] == "Won"].copy()
+            won_df = won_df[won_df["close_date"].notna()]
+            wins_by_month = {}
+            for i in range(3, 0, -1):
+                start = now - timedelta(days=30 * i)
+                end = now - timedelta(days=30 * (i - 1))
+                label = start.strftime("%b %Y")
+                wins = len(won_df[(won_df["close_date"] >= start) & (won_df["close_date"] < end)])
+                wins_by_month[label] = wins
+            ctx["wins_per_month_last_3_months"] = wins_by_month
+
+            # Open deal aging
+            open_d = deals_df[deals_df["deal_status"] == "Open"].copy()
+            open_d = open_d[open_d["created_date"].notna()]
+            if len(open_d) > 0:
+                open_d["age_days"] = (now - open_d["created_date"]).dt.days
+                ctx["open_deal_aging"] = {
+                    "avg_age_days": round(open_d["age_days"].mean()),
+                    "under_30_days": int(len(open_d[open_d["age_days"] <= 30])),
+                    "30_to_60_days": int(len(open_d[(open_d["age_days"] > 30) & (open_d["age_days"] <= 60)])),
+                    "60_to_90_days": int(len(open_d[(open_d["age_days"] > 60) & (open_d["age_days"] <= 90)])),
+                    "over_90_days_stale": int(len(open_d[open_d["age_days"] > 90])),
+                }
+
+            # Avg days to close
+            won_timed = deals_df[deals_df["deal_status"] == "Won"].copy()
+            won_timed = won_timed[won_timed["created_date"].notna()]
+            won_timed["close_date_dt"] = pd.to_datetime(won_timed["close_date"], errors="coerce")
+            won_timed = won_timed[won_timed["close_date_dt"].notna()]
+            if len(won_timed) > 0:
+                won_timed["days_to_close"] = (won_timed["close_date_dt"] - won_timed["created_date"]).dt.days
+                won_timed = won_timed[won_timed["days_to_close"] >= 0]
+                if len(won_timed) > 0:
+                    ctx["avg_days_to_close"] = {
+                        "overall": round(won_timed["days_to_close"].mean()),
+                        "note": "Avg calendar days from deal creation to won status"
+                    }
+
+    # ── Weighted pipeline forecast ──
+    prob_map = {"High": 0.8, "Medium": 0.5, "Low": 0.2}
+    open_vals = deals_df[(deals_df["deal_status"] == "Open") & deals_df["deal_value"].notna()].copy()
+    open_vals = open_vals[open_vals["deal_value"] > 0]
+    if len(open_vals) > 0:
+        open_vals["prob_score"] = open_vals["closure_probability"].map(prob_map).fillna(0.1)
+        open_vals["weighted"] = open_vals["deal_value"] * open_vals["prob_score"]
+        ctx["weighted_pipeline_forecast"] = {
+            "raw_open_pipeline": _cr(open_vals["deal_value"].sum()),
+            "probability_adjusted_forecast": _cr(open_vals["weighted"].sum()),
+            "open_deals_with_values": len(open_vals),
+            "open_deals_total": len(deals_df[deals_df["deal_status"] == "Open"]),
+            "methodology": "High=80%, Medium=50%, Low=20%, Unrated=10%"
+        }
 
     return ctx
 
 
-def build_orders_context(orders_df):
-    """
-    Pre-compute ALL work order metrics:
-    - Overall execution status, sector breakdown
-    - Financial totals: contract, collected, receivable, billed
-    - Collection rate
-    - Per-sector deep financials
-    - Billing/WO status breakdown
-    """
-    ctx = {}
+# ─────────────────────────────────────────
+# WORK ORDERS CONTEXT
+# ─────────────────────────────────────────
 
+def build_orders_context(orders_df):
+    ctx = {}
     ctx["total_work_orders"] = len(orders_df)
     ctx["execution_status_overall"] = orders_df["execution_status"].value_counts().to_dict()
     ctx["sector_count"] = orders_df["sector"].value_counts().to_dict()
 
-    # ── Overall financials ──
     def safe_sum(col):
         if col not in orders_df.columns:
             return None
@@ -163,32 +311,23 @@ def build_orders_context(orders_df):
         "total_collected_incl_gst": _cr(total_collected),
         "total_receivable": _cr(total_receivable),
         "total_billed_excl_gst": _cr(total_billed),
-        "collection_rate": f"{round(total_collected / total_contract_incl * 100, 1)}% (collected / contract incl GST)"
+        "collection_rate": f"{round(total_collected / total_contract_incl * 100, 1)}%"
                            if total_collected and total_contract_incl else "N/A",
         "wos_with_contract_value": len(orders_df["amount_excl_gst"].dropna()),
         "wos_missing_contract_value": len(orders_df) - len(orders_df["amount_excl_gst"].dropna()),
     }
 
-    # ── Per-sector work order stats ──
+    # ── Per-sector WO stats ──
     sector_stats = {}
     for sector in sorted(orders_df["sector"].dropna().unique()):
         s = orders_df[orders_df["sector"] == sector]
-        exec_counts = s["execution_status"].value_counts().to_dict()
-
-        c = s["collected_amount"].dropna()
-        c = c[c > 0]
-        r = s["amount_receivable"].dropna()
-        r = r[r > 0]
-        a = s["amount_excl_gst"].dropna()
-        a = a[a > 0]
-        b = s["billed_excl_gst"].dropna()
-        b = b[b > 0]
-
-        coll_rate = None
-        a_incl = s["amount_incl_gst"].dropna()
-        a_incl = a_incl[a_incl > 0]
-        if len(c) > 0 and len(a_incl) > 0:
-            coll_rate = f"{round(c.sum() / a_incl.sum() * 100, 1)}%"
+        exec_counts = s["execution_status"].value_counts().to_dict() if "execution_status" in s.columns else {}
+        c = s["collected_amount"].dropna(); c = c[c > 0]
+        r = s["amount_receivable"].dropna(); r = r[r > 0]
+        a = s["amount_excl_gst"].dropna(); a = a[a > 0]
+        b = s["billed_excl_gst"].dropna(); b = b[b > 0]
+        a_incl = s["amount_incl_gst"].dropna(); a_incl = a_incl[a_incl > 0]
+        coll_rate = f"{round(c.sum() / a_incl.sum() * 100, 1)}%" if len(c) > 0 and len(a_incl) > 0 else "N/A"
 
         sector_stats[sector] = {
             "total_orders": len(s),
@@ -197,36 +336,36 @@ def build_orders_context(orders_df):
             "collected": _cr(c.sum()) if len(c) > 0 else "N/A",
             "receivable": _cr(r.sum()) if len(r) > 0 else "N/A",
             "billed_excl_gst": _cr(b.sum()) if len(b) > 0 else "N/A",
-            "collection_rate": coll_rate if coll_rate else "N/A",
+            "collection_rate": coll_rate,
         }
-
     ctx["by_sector"] = sector_stats
 
-    # ── Billing status breakdown ──
+    # Pre-computed collection flags with guardrails (3+ WOs minimum)
+    ctx["collection_rate_flags"] = _flag_collection_rates(sector_stats)
+
     if "billing_status" in orders_df.columns:
         ctx["billing_status_breakdown"] = orders_df["billing_status"].value_counts().to_dict()
-
-    # ── WO status (open/closed) ──
     if "wo_status" in orders_df.columns:
         ctx["wo_status_breakdown"] = orders_df["wo_status"].value_counts().to_dict()
 
     return ctx
 
 
+# ─────────────────────────────────────────
+# FULL CONTEXT ASSEMBLER
+# ─────────────────────────────────────────
+
 def build_full_context(deals_df, orders_df, question, quality_summary, chat_history):
-    """
-    Assemble final JSON context dict for the LLM.
-    """
     deals_ctx = build_deals_context(deals_df)
     orders_ctx = build_orders_context(orders_df)
 
     quality_notes = [
         f"{quality_summary.get('missing_deal_value', 0)} deals missing deal value ({quality_summary.get('pct_missing_value', '?')})",
         f"{quality_summary.get('missing_closure_probability', 0)} deals missing closure probability ({quality_summary.get('pct_missing_probability', '?')})",
-        f"{quality_summary.get('missing_close_dates', 0)} deals missing close dates — tentative used as fallback",
-        f"{quality_summary.get('skipped_header_rows', 0)} duplicate header rows removed from source data",
-        f"{quality_summary.get('billing_typos_fixed', 0)} billing status typos fixed (BIlled → Billed)",
-        "Financial values of 0 treated as missing/not entered — not actual zero revenue",
+        f"{quality_summary.get('missing_close_dates', 0)} deals missing close dates",
+        f"{quality_summary.get('skipped_header_rows', 0)} duplicate header rows removed",
+        f"{quality_summary.get('billing_typos_fixed', 0)} billing status typos fixed",
+        "Financial values of 0 treated as missing — not actual zero revenue",
     ]
 
     return {

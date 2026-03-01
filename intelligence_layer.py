@@ -30,7 +30,7 @@ def generate_answer(question, deals_df, orders_df, chat_history, quality_summary
         chat_history=chat_history
     )
 
-    context_json = json.dumps(context_dict, indent=2, default=str)
+    context_json = json.dumps(context_dict, default=str)  # no indent = ~300 fewer tokens
     user_prompt = build_user_prompt(context_json, question, chat_history)
 
     response = client.chat.completions.create(
