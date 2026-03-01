@@ -2,6 +2,11 @@
 # Builds pre-computed stats passed to the LLM as structured context.
 # Interpretation logic lives HERE — not in the prompt.
 # Prompt only formats and presents. This layer computes and interprets.
+#
+# Updates:
+# [1] quarterly_pipeline added — enables last quarter comparison
+# [2] value_distribution added — enables threshold filter answers
+# [3] active_filters passed through to context so LLM sees them
 
 import json
 import pandas as pd
@@ -17,78 +22,53 @@ def _cr(value):
 
 
 # ─────────────────────────────────────────
-# INTERPRETATION HELPERS — data-driven, not prompt-injected
+# INTERPRETATION HELPERS
 # ─────────────────────────────────────────
 
 def _interpret_velocity(velocity_dict):
-    """
-    Pre-compute velocity trend from data.
-    Prompt reads this label — never infers it from raw numbers.
-    """
     if not velocity_dict:
         return "insufficient data"
-
     counts = [v["deals_created"] for v in velocity_dict.values()]
     months = list(velocity_dict.keys())
-
     if len(counts) < 2:
         return "insufficient data"
-
     max_val = max(counts)
     avg_others = (sum(counts) - max_val) / max(len(counts) - 1, 1)
-
-    # Spike: one month is 5x+ average of the others
     if max_val > 0 and avg_others > 0 and max_val >= 5 * avg_others:
         spike_month = months[counts.index(max_val)]
         return f"SPIKE in {spike_month} ({max_val} deals) — likely batch entry or real growth burst. Treat with caution."
-
-    # Slowdown: each month strictly decreasing
     if all(counts[i] >= counts[i + 1] for i in range(len(counts) - 1)):
         return "SLOWDOWN — deal creation declining month over month"
-
-    # Growth: each month strictly increasing
     if all(counts[i] <= counts[i + 1] for i in range(len(counts) - 1)):
         return "GROWTH — deal creation accelerating"
-
     return "MIXED — no clear trend across available months"
 
 
 def _flag_collection_rates(sector_stats):
-    """
-    Pre-compute collection rate flags with guardrails.
-    Only flags sectors with 3+ work orders (avoids false alarms on missing data).
-    """
-    urgent = []
-    healthy = []
-
+    urgent, healthy = [], []
     for sector, stats in sector_stats.items():
         rate_str = stats.get("collection_rate", "N/A")
         total_orders = stats.get("total_orders", 0)
-
-        # Guardrail: skip if no WOs or insufficient sample
         if rate_str == "N/A" or total_orders < 3:
             continue
-
         try:
             rate = float(rate_str.replace("%", ""))
         except (ValueError, TypeError):
             continue
-
         if rate < 5:
-            receivable = stats.get("receivable", "N/A")
             urgent.append({
                 "sector": sector,
                 "collection_rate": rate_str,
-                "receivable_stuck": receivable,
+                "receivable_stuck": stats.get("receivable", "N/A"),
                 "total_orders": total_orders
             })
         elif rate >= 60:
-            healthy.append({
-                "sector": sector,
-                "collection_rate": rate_str
-            })
-
+            healthy.append({"sector": sector, "collection_rate": rate_str})
     return {"urgent_blockers": urgent, "healthy_sectors": healthy}
+
+
+def _quarter_label(i):
+    return "this_quarter" if i == 0 else f"last_{i}_quarter{'s' if i > 1 else ''}_ago"
 
 
 # ─────────────────────────────────────────
@@ -113,6 +93,20 @@ def build_deals_context(deals_df):
     ctx["deals_missing_values"] = total - len(all_vals)
     ctx["pct_missing_values"] = f"{round((total - len(all_vals)) / max(total, 1) * 100)}%"
 
+    # ── Value distribution — enables threshold filter answers ──
+    if len(all_vals) > 0:
+        ctx["value_distribution"] = {
+            "min_deal_value": _cr(all_vals.min()),
+            "max_deal_value": _cr(all_vals.max()),
+            "median_deal_value": _cr(all_vals.median()),
+            "deals_above_1cr": int((all_vals >= 10_000_000).sum()),
+            "deals_above_50L": int((all_vals >= 5_000_000).sum()),
+            "deals_above_10L": int((all_vals >= 1_000_000).sum()),
+            "deals_above_1L": int((all_vals >= 100_000).sum()),
+            "deals_above_50k": int((all_vals >= 50_000).sum()),
+            "note": "All deals with values are above Rs 50,000 — threshold filters below Rs 50k have no effect"
+        }
+
     prob_counts = deals_df["closure_probability"].value_counts().to_dict()
     ctx["closure_probability_overall"] = {
         "High": prob_counts.get("High", 0),
@@ -131,18 +125,13 @@ def build_deals_context(deals_df):
         open_ = len(s[s["deal_status"] == "Open"])
         on_hold = len(s[s["deal_status"] == "On Hold"])
         total_closed = won + dead
-
         vals = s["deal_value"].dropna()
         vals = vals[vals > 0]
-
         open_deals = s[s["deal_status"] == "Open"]
         open_prob = open_deals["closure_probability"].value_counts().to_dict()
         open_unrated = int(open_deals["closure_probability"].isna().sum())
-
-        # Null-safe win rate
         win_rate = f"{round(won / total_closed * 100, 1)}%" if total_closed > 0 else "N/A (no closed deals)"
         insufficient = total_closed < 5
-
         sector_stats[sector] = {
             "total": len(s),
             "won": won,
@@ -160,7 +149,7 @@ def build_deals_context(deals_df):
         }
     ctx["by_sector"] = sector_stats
 
-    # ── Win rate ranking (only sectors with 5+ closed deals) ──
+    # ── Win rate ranking ──
     ctx["win_rate_ranking"] = sorted(
         [
             {
@@ -202,14 +191,13 @@ def build_deals_context(deals_df):
             for group, stages in stage_funnel.items()
         }
 
-    # ── TIME-BASED VELOCITY ──
+    # ── TIME-BASED VELOCITY + QUARTERLY PIPELINE ──
     if "created_date" in deals_df.columns:
         deals_with_dates = deals_df[deals_df["created_date"].notna()].copy()
-
         if len(deals_with_dates) > 0:
             now = deals_df["created_date"].max()
 
-            # Monthly velocity last 3 months
+            # Monthly velocity
             velocity = {}
             for i in range(3, 0, -1):
                 start = now - timedelta(days=30 * i)
@@ -220,9 +208,7 @@ def build_deals_context(deals_df):
                     (deals_with_dates["created_date"] < end)
                 ])
                 velocity[label] = {"deals_created": created}
-
             ctx["deal_creation_velocity_last_3_months"] = velocity
-            # Pre-computed interpretation — prompt reads this, never infers it
             ctx["velocity_interpretation"] = _interpret_velocity(velocity)
 
             # Wins per month
@@ -236,6 +222,67 @@ def build_deals_context(deals_df):
                 wins = len(won_df[(won_df["close_date"] >= start) & (won_df["close_date"] < end)])
                 wins_by_month[label] = wins
             ctx["wins_per_month_last_3_months"] = wins_by_month
+
+            # ── QUARTERLY PIPELINE — enables Q vs Q comparisons ──
+            quarterly = {}
+            for i in range(4):
+                q_end = now - timedelta(days=90 * i)
+                q_start = now - timedelta(days=90 * (i + 1))
+                label = "this_quarter" if i == 0 else f"{i}_quarter{'s' if i > 1 else ''}_ago"
+                window = deals_with_dates[
+                    (deals_with_dates["created_date"] >= q_start) &
+                    (deals_with_dates["created_date"] < q_end)
+                ]
+                vals_q = window["deal_value"].dropna()
+                vals_q = vals_q[vals_q > 0]
+                won_q = len(window[window["deal_status"] == "Won"])
+                dead_q = len(window[window["deal_status"] == "Dead"])
+                wr_q = f"{round(won_q / (won_q + dead_q) * 100, 1)}%" if (won_q + dead_q) > 0 else "N/A"
+
+                # Per-sector breakdown for this quarter
+                sector_q = {}
+                for sector in window["sector"].dropna().unique():
+                    sw = window[window["sector"] == sector]
+                    sv = sw["deal_value"].dropna()
+                    sv = sv[sv > 0]
+                    sector_q[sector] = {
+                        "deals": len(sw),
+                        "pipeline_value": _cr(sv.sum()) if len(sv) > 0 else "N/A",
+                        "won": len(sw[sw["deal_status"] == "Won"])
+                    }
+
+                quarterly[label] = {
+                    "period": f"{q_start.strftime('%d %b %Y')} to {q_end.strftime('%d %b %Y')}",
+                    "total_deals_created": len(window),
+                    "pipeline_value": _cr(vals_q.sum()) if len(vals_q) > 0 else "N/A",
+                    "deals_with_values": len(vals_q),
+                    "won_deals": won_q,
+                    "dead_deals": dead_q,
+                    "win_rate": wr_q,
+                    "by_sector": sector_q
+                }
+            ctx["quarterly_pipeline"] = quarterly
+
+            # QoQ change summary
+            this_q_val = deals_df[
+                (deals_df["created_date"] >= (now - timedelta(days=90))) &
+                deals_df["deal_value"].notna() &
+                (deals_df["deal_value"] > 0)
+            ]["deal_value"]
+            last_q_val = deals_df[
+                (deals_df["created_date"] >= (now - timedelta(days=180))) &
+                (deals_df["created_date"] < (now - timedelta(days=90))) &
+                deals_df["deal_value"].notna() &
+                (deals_df["deal_value"] > 0)
+            ]["deal_value"]
+            if len(last_q_val) > 0 and last_q_val.sum() > 0:
+                pct_change = round((this_q_val.sum() - last_q_val.sum()) / last_q_val.sum() * 100, 1)
+                ctx["qoq_pipeline_change"] = {
+                    "this_quarter_value": _cr(this_q_val.sum()),
+                    "last_quarter_value": _cr(last_q_val.sum()),
+                    "pct_change": f"{'+' if pct_change >= 0 else ''}{pct_change}%",
+                    "interpretation": "GROWTH" if pct_change > 10 else "DECLINE" if pct_change < -10 else "STABLE"
+                }
 
             # Open deal aging
             open_d = deals_df[deals_df["deal_status"] == "Open"].copy()
@@ -317,7 +364,6 @@ def build_orders_context(orders_df):
         "wos_missing_contract_value": len(orders_df) - len(orders_df["amount_excl_gst"].dropna()),
     }
 
-    # ── Per-sector WO stats ──
     sector_stats = {}
     for sector in sorted(orders_df["sector"].dropna().unique()):
         s = orders_df[orders_df["sector"] == sector]
@@ -328,7 +374,6 @@ def build_orders_context(orders_df):
         b = s["billed_excl_gst"].dropna(); b = b[b > 0]
         a_incl = s["amount_incl_gst"].dropna(); a_incl = a_incl[a_incl > 0]
         coll_rate = f"{round(c.sum() / a_incl.sum() * 100, 1)}%" if len(c) > 0 and len(a_incl) > 0 else "N/A"
-
         sector_stats[sector] = {
             "total_orders": len(s),
             "execution_status": exec_counts,
@@ -339,8 +384,6 @@ def build_orders_context(orders_df):
             "collection_rate": coll_rate,
         }
     ctx["by_sector"] = sector_stats
-
-    # Pre-computed collection flags with guardrails (3+ WOs minimum)
     ctx["collection_rate_flags"] = _flag_collection_rates(sector_stats)
 
     if "billing_status" in orders_df.columns:
@@ -355,7 +398,7 @@ def build_orders_context(orders_df):
 # FULL CONTEXT ASSEMBLER
 # ─────────────────────────────────────────
 
-def build_full_context(deals_df, orders_df, question, quality_summary, chat_history):
+def build_full_context(deals_df, orders_df, question, quality_summary, chat_history, active_filters=None):
     deals_ctx = build_deals_context(deals_df)
     orders_ctx = build_orders_context(orders_df)
 
@@ -370,6 +413,7 @@ def build_full_context(deals_df, orders_df, question, quality_summary, chat_hist
 
     return {
         "question": question,
+        "active_filters": active_filters or [],
         "previous_conversation": chat_history or "First question in session.",
         "deals": deals_ctx,
         "work_orders": orders_ctx,
